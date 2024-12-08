@@ -1188,6 +1188,241 @@ class GeneratePDN(OpenROADStep):
         return views_updates, metric_updates_with_aggregates
 
 
+@Step.factory.register()
+class AcceleratedGlobalPlacement(OpenROADStep):
+    config_vars = (
+        OpenROADStep.config_vars
+        + routing_layer_variables
+        + [
+            Variable(
+                "PL_TARGET_DENSITY_PCT",
+                Optional[Decimal],
+                "The desired placement density of cells. If not specified, the value will be equal to (`FP_CORE_UTIL` + 5 * `GPL_CELL_PADDING` + 10).",
+                units="%",
+                deprecated_names=[
+                    ("PL_TARGET_DENSITY", lambda d: Decimal(d) * Decimal(100.0))
+                ],
+            ),
+            Variable(
+                "PL_SKIP_INITIAL_PLACEMENT",
+                bool,
+                "Specifies whether the placer should run initial placement or not.",
+                default=False,
+            ),
+            Variable(
+                "PL_WIRE_LENGTH_COEF",
+                Decimal,
+                "Global placement initial wirelength coefficient."
+                + " Decreasing the variable will modify the initial placement of the standard cells to reduce the wirelengths",
+                default=0.25,
+                deprecated_names=["PL_WIRELENGTH_COEF"],
+            ),
+            Variable(
+                "PL_MIN_PHI_COEFFICIENT",
+                Optional[Decimal],
+                "Sets a lower bound on the µ_k variable in the GPL algorithm. Useful if global placement diverges. See https://openroad.readthedocs.io/en/latest/main/src/gpl/README.html",
+            ),
+            Variable(
+                "PL_MAX_PHI_COEFFICIENT",
+                Optional[Decimal],
+                "Sets a upper bound on the µ_k variable in the GPL algorithm. Useful if global placement diverges.See https://openroad.readthedocs.io/en/latest/main/src/gpl/README.html",
+            ),
+            Variable(
+                "FP_CORE_UTIL",
+                Decimal,
+                "The core utilization percentage.",
+                default=50,
+                units="%",
+            ),
+            Variable(
+                "GPL_CELL_PADDING",
+                Decimal,
+                "Cell padding value (in sites) for global placement. The number will be integer divided by 2 and placed on both sides.",
+                units="sites",
+                pdk=True,
+            ),
+        ]
+    )
+
+    id = "OpenROAD.AcceleratedGlobalPlacement"
+    name = "AGP"
+    long_name = "Accelerated Global Placement"
+
+    inputs = [DesignFormat.JSON_HEADER]
+    outputs = [
+        DesignFormat.ODB,
+        DesignFormat.DEF
+    ]
+
+    def get_script_path(self):
+        return os.path.join(get_script_dir(), "openroad", "write_views.tcl")
+    
+    def get_command_gpu(self, ds) -> List[str]:
+        return ['python','/home/will/Documents/personal_projects/DREAMPlace/install/dreamplace/Placer.py', str(os.path.join(self.step_dir,'pl_in.json'))]
+
+
+    def prepare_env(self, env: dict, state: State) -> dict:
+        env = super().prepare_env(env, state)
+
+        lib_list = self.toolbox.filter_views(self.config, self.config["LIB"])
+        lib_list += self.toolbox.get_macro_views(self.config, DesignFormat.LIB)
+
+        env["_SDC_IN"] = self.config["PNR_SDC_FILE"] or self.config["FALLBACK_SDC_FILE"]
+        env["_PNR_LIBS"] = TclStep.value_to_tcl(lib_list)
+        env["_MACRO_LIBS"] = TclStep.value_to_tcl(
+            self.toolbox.get_macro_views(self.config, DesignFormat.LIB)
+        )
+
+        excluded_cells: Set[str] = set(self.config["EXTRA_EXCLUDED_CELLS"] or [])
+        excluded_cells.update(process_list_file(self.config["PNR_EXCLUDED_CELL_FILE"]))
+        env["_PNR_EXCLUDED_CELLS"] = TclUtils.join(excluded_cells)
+
+        return env
+    
+    def generate_in_json(self, state, env):
+        print(state)
+
+        lefs = list(self.config['TECH_LEFS'].values()) + self.config['CELL_LEFS'] 
+        lefs = list(map(lambda x: str(x), lefs))
+        config_json ={
+                        "lef_input" : lefs, 
+                        "def_input" : str(state['def']), 
+                        "verilog_input" : str(state['nl']), 
+                        "gpu" : 1,
+                        "global_place_stages" : [
+                            {"num_bins_x" : 1024, "num_bins_y" : 1024, "iteration" : 1000, "learning_rate" : 0.01, "wirelength" : "weighted_average", "optimizer" : "nesterov"}
+                        ],
+                        "target_density" : 0.6,
+                        "density_weight" : 8e-5,
+                        "gamma" : 4,
+                        "random_seed" : 1000,
+                        "ignore_net_degree" : 100,
+                        "enable_fillers" : 1,
+                        "gp_noise_ratio" : 0.025,
+                        "global_place_flag" : 1,
+                        "legalize_flag" : 1,
+                        "detailed_place_flag" : 0,
+                        "stop_overflow" : 0.1, 
+                        "dtype" : "float32", 
+                        "plot_flag" : 0, 
+                        "random_center_init_flag" : 1, 
+                        "sort_nets_by_degree" : 0, 
+                        "num_threads" : 8,
+                        "timing_opt_flag" : 0,
+                        "net_weighting_scheme": "lilith",
+                        "momentum_decay_factor" : 0.5,
+                        "max_net_weight" : 1024,
+                        "enable_net_weighting" : 1,
+                        "result_dir" : str(self.step_dir)
+                        }
+
+        return config_json
+
+    
+    def run(self, state_in, **kwargs) -> Tuple[ViewsUpdate, MetricsUpdate]:
+        """
+        The `run()` override for the OpenROADStep class handles two things:
+
+        1. Before the `super()` call: It creates a version of the lib file
+        minus cells that are known bad (i.e. those that fail DRC) and pass it on
+        in the environment variable `_PNR_LIBS`.
+
+        2. After the `super()` call: Processes the `or_metrics_out.json` file and
+        updates the State's `metrics` property with any new metrics in that object.
+        """
+        kwargs, env = self.extract_env(kwargs)
+        env = self.prepare_env(env, state_in)
+
+        check = False
+        if "check" in kwargs:
+            check = kwargs.pop("check")
+
+        if self.config["PL_TARGET_DENSITY_PCT"] is None:
+            util = self.config["FP_CORE_UTIL"]
+            metrics_util = state_in.metrics.get("design__instance__utilization")
+            if metrics_util is not None:
+                util = metrics_util * 100
+
+            expr = util + (5 * self.config["GPL_CELL_PADDING"]) + 10
+            expr = min(expr, 100)
+            env["PL_TARGET_DENSITY_PCT"] = f"{expr}"
+            info(
+                f"'PL_TARGET_DENSITY_PCT' not explicitly set, using dynamically calculated target density: {expr}…"
+            )
+
+        command = self.get_command_gpu(float(env['PL_TARGET_DENSITY_PCT'])/100)
+
+        filename = self.step_dir + '/pl_in.json'
+
+        with open(filename, 'w') as file:
+            json.dump(self.generate_in_json(state_in, env), file)
+
+        new_env = os.environ.copy()  # Copy the current environment
+        subprocess_result = self.run_subprocess(
+            command,
+            env=new_env,
+            cwd='/home/will/Documents/personal_projects/DREAMPlace/install',
+            **kwargs,
+        )
+
+
+        flname = state_in['nl'].split('/')[-1].split('.v')[0]
+        env[f"SAVE_DEF"] = str(self.step_dir) + "/"+ flname + "/" + flname + ".gp.def"
+        env[f"CURRENT_DEF"] = env[f"SAVE_DEF"]
+        generated_metrics = subprocess_result["generated_metrics"]
+        metrics_path = os.path.join(self.step_dir, "or_metrics_out.json")
+        command =[
+            "openroad",
+            "-exit",
+            "-no_splash",
+            "-metrics",
+            metrics_path,
+            self.get_script_path(),
+        ]
+        subprocess_result = self.run_subprocess(
+            command,
+            env=env,
+            **kwargs,
+        )
+        views_updates: ViewsUpdate = {}
+        for output in self.outputs:
+            if output.value.multiple:
+                # Too step-specific.
+                continue
+            path = Path(env[f"SAVE_{output.name}"])
+            if not path.exists():
+                continue
+            views_updates[output] = path
+
+        # 1. Parse warnings and errors
+        alerts = subprocess_result["openroad_alerts"]
+        if subprocess_result["returncode"] != 0:
+            error_strings = [str(alert) for alert in alerts if alert.cls == "error"]
+            if len(error_strings):
+                error_string = "\n".join(error_strings)
+                raise StepError(
+                    f"{self.id} failed with the following errors:\n{error_string}"
+                )
+            else:
+                raise StepException(
+                    f"{self.id} failed unexpectedly. Please check the logs and file an issue."
+                )
+        # 2. Metrics
+        metrics_path = os.path.join(self.step_dir, "or_metrics_out.json")
+        if os.path.exists(metrics_path):
+            or_metrics_out = json.loads(open(metrics_path).read(), parse_float=Decimal)
+            for key, value in or_metrics_out.items():
+                if value == "Infinity":
+                    or_metrics_out[key] = inf
+                elif value == "-Infinity":
+                    or_metrics_out[key] = -inf
+            generated_metrics.update(or_metrics_out)
+
+        metric_updates_with_aggregates = aggregate_metrics(generated_metrics)
+
+        return views_updates, metric_updates_with_aggregates
+
+
 class _GlobalPlacement(OpenROADStep):
     config_vars = (
         OpenROADStep.config_vars
